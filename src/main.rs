@@ -5,7 +5,6 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::task::JoinSet;
 
 type Error = Box<dyn std::error::Error>;
 type Result<T> = std::result::Result<T, Error>;
@@ -16,115 +15,71 @@ enum Side {
     Upstream,
 }
 
-#[derive(Debug)]
-enum Direction {
-    Receive,
-    Transmit,
-}
-
-struct TransferOutcome {
-    bytes_transferred: usize,
-    side: Side,
-    direction: Direction,
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
     let listener = TcpListener::bind("0.0.0.0:8080").await?;
-    let mut flow_counter = 0;
+    let mut session_counter = 0;
     loop {
         let (socket, _) = listener.accept().await?;
-        flow_counter += 1;
+        session_counter += 1;
         tokio::spawn(async move {
-            let _ = handle_flow(socket, flow_counter).await;
+            let _ = handle_session(socket, session_counter).await;
         });
     }
 }
 
-async fn handle_flow(down_socket: TcpStream, flow_number: u64) -> Result<()> {
+async fn handle_session(down_socket: TcpStream, session_number: u64) -> Result<()> {
     let up_socket = TcpStream::connect("127.0.0.1:8081").await?;
 
     let (down_sock_rx, down_sock_tx) = down_socket.into_split();
     let (up_sock_rx, up_sock_tx) = up_socket.into_split();
 
-    let mut set = JoinSet::new();
+    let (source, sink): (Sender<BytesMut>, Receiver<BytesMut>) = mpsc::channel(4);
+    let (sink_return, source_return): (Sender<BytesMut>, Receiver<BytesMut>) = mpsc::channel(4);
+
+    let downstream_rx = tokio::spawn(read(
+        down_sock_rx,
+        source,
+        source_return,
+        Side::Downstream,
+        session_number,
+    ));
+    let upstream_tx = tokio::spawn(write(
+        up_sock_tx,
+        sink,
+        sink_return,
+        Side::Upstream,
+        session_number,
+    ));
 
     let (source, sink): (Sender<BytesMut>, Receiver<BytesMut>) = mpsc::channel(4);
     let (sink_return, source_return): (Sender<BytesMut>, Receiver<BytesMut>) = mpsc::channel(4);
 
-    set.spawn(async move {
-        read(
-            down_sock_rx,
-            source,
-            source_return,
-            Side::Downstream,
-            flow_number,
-        )
-        .await
-    });
-    set.spawn(
-        async move { write(up_sock_tx, sink, sink_return, Side::Upstream, flow_number).await },
-    );
+    let upstream_rx = tokio::spawn(read(
+        up_sock_rx,
+        source,
+        source_return,
+        Side::Upstream,
+        session_number,
+    ));
+    let downstream_tx = tokio::spawn(write(
+        down_sock_tx,
+        sink,
+        sink_return,
+        Side::Downstream,
+        session_number,
+    ));
 
-    let (source, sink): (Sender<BytesMut>, Receiver<BytesMut>) = mpsc::channel(4);
-    let (sink_return, source_return): (Sender<BytesMut>, Receiver<BytesMut>) = mpsc::channel(4);
-
-    set.spawn(async move {
-        read(
-            up_sock_rx,
-            source,
-            source_return,
-            Side::Upstream,
-            flow_number,
-        )
-        .await
-    });
-    set.spawn(async move {
-        write(
-            down_sock_tx,
-            sink,
-            sink_return,
-            Side::Downstream,
-            flow_number,
-        )
-        .await
-    });
-
-    let mut downstream_bytes_read = 0;
-    let mut upstream_bytes_read = 0;
-    let mut downstream_bytes_written = 0;
-    let mut upstream_bytes_written = 0;
-    while let Some(res) = set.join_next().await {
-        match res {
-            Ok(TransferOutcome {
-                bytes_transferred,
-                side,
-                direction,
-            }) => match (side, direction) {
-                (Side::Downstream, Direction::Receive) => {
-                    downstream_bytes_read += bytes_transferred;
-                }
-                (Side::Upstream, Direction::Receive) => {
-                    upstream_bytes_read += bytes_transferred;
-                }
-                (Side::Downstream, Direction::Transmit) => {
-                    downstream_bytes_written += bytes_transferred;
-                }
-                (Side::Upstream, Direction::Transmit) => {
-                    upstream_bytes_written += bytes_transferred;
-                }
-            },
-            Err(e) => {
-                debug!("Error: {:?}", e);
-            }
-        }
-    }
+    let downstream_bytes_read = downstream_rx.await?;
+    let upstream_bytes_read = upstream_rx.await?;
+    let downstream_bytes_written = downstream_tx.await?;
+    let upstream_bytes_written = upstream_tx.await?;
 
     // TODO: report the duration of the flow.
     info!(
-        "[Flow {}] Downstream RX: {} TX: {} Upstream RX: {} TX: {}",
-        flow_number,
+        "[Session {}] Downstream RX: {} TX: {} Upstream RX: {} TX: {}",
+        session_number,
         downstream_bytes_read,
         downstream_bytes_written,
         upstream_bytes_read,
@@ -139,62 +94,60 @@ async fn read(
     source: Sender<BytesMut>,
     mut source_return: Receiver<BytesMut>,
     side: Side,
-    flow_number: u64,
-) -> TransferOutcome {
-    debug!("[Flow {flow_number}] {side:?} reader: starting");
+    session_number: u64,
+) -> usize {
+    debug!("[Session {session_number}] {side:?} reader: starting");
     let mut buf_count = 0;
     let mut total_bytes_read = 0;
     loop {
         let mut buf: BytesMut = if buf_count < 2 {
-            debug!("[Flow {flow_number}] {side:?} reader: creating new buffer");
+            debug!("[Session {session_number}] {side:?} reader: creating new buffer");
             buf_count += 1;
             BytesMut::with_capacity(1024)
         } else {
-            debug!("[Flow {flow_number}] {side:?} reader: waiting for return buffer");
+            debug!("[Session {session_number}] {side:?} reader: waiting for return buffer");
             match source_return.recv().await {
                 Some(mut buf) => {
-                    debug!("[Flow {flow_number}] {side:?} reader: got return buffer");
+                    debug!("[Session {session_number}] {side:?} reader: got return buffer");
                     buf.clear();
                     buf
                 }
                 None => {
-                    debug!("[Flow {flow_number}] {side:?} reader: no return buffer available");
+                    debug!(
+                        "[Session {session_number}] {side:?} reader: no return buffer available"
+                    );
                     break;
                 }
             }
         };
 
-        debug!("[Flow {flow_number}] {side:?} reader: Waiting for data to read...");
+        debug!("[Session {session_number}] {side:?} reader: Waiting for data to read...");
         match sock_rx.read_buf(&mut buf).await {
             Ok(_) => {
                 total_bytes_read += buf.len();
                 if buf.is_empty() {
-                    debug!("[Flow {flow_number}] {side:?} reader: read 0 bytes, closing");
+                    debug!("[Session {session_number}] {side:?} reader: read 0 bytes, closing");
                     break;
                 }
                 debug!(
-                    "[Flow {flow_number}] {side:?} reader: read {} bytes, passing buffer to other side",
+                    "[Session {session_number}] {side:?} reader: read {} bytes, passing buffer to other side",
                     buf.len()
                 );
                 if source.send(buf).await.is_err() {
                     debug!(
-                        "[Flow {flow_number}] {side:?} reader: error passing buffer to other side"
+                        "[Session {session_number}] {side:?} reader: error passing buffer to other side"
                     );
                     break;
                 }
             }
             Err(_) => {
-                debug!("[Flow {flow_number}] {side:?} reader: read error");
+                debug!("[Session {session_number}] {side:?} reader: read error");
                 break;
             }
         }
     }
-    debug!("[Flow {flow_number}] {side:?} reader: exiting");
-    TransferOutcome {
-        bytes_transferred: total_bytes_read,
-        side,
-        direction: Direction::Receive,
-    }
+    debug!("[Session {session_number}] {side:?} reader: exiting");
+    total_bytes_read
 }
 
 async fn write(
@@ -202,36 +155,32 @@ async fn write(
     mut sink: Receiver<BytesMut>,
     sink_return: Sender<BytesMut>,
     side: Side,
-    flow_number: u64,
-) -> TransferOutcome {
-    debug!("[Flow {flow_number}] {side:?} writer: starting and waiting for a buffer");
+    session_number: u64,
+) -> usize {
+    debug!("[Session {session_number}] {side:?} writer: starting and waiting for a buffer");
     let mut total_bytes_written = 0;
     while let Some(mut buf) = sink.recv().await {
         let buf_len = buf.len();
-        debug!("[Flow {flow_number}] {side:?} writer: got a buffer, writing...");
+        debug!("[Session {session_number}] {side:?} writer: got a buffer, writing...");
         match sock_tx.write_all_buf(&mut buf).await {
             Ok(_) => {
                 total_bytes_written += buf_len;
-                debug!("[Flow {flow_number}] {side:?} writer: write complete, clearing buffer and sending back");
+                debug!("[Session {session_number}] {side:?} writer: write complete, clearing buffer and sending back");
                 buf.clear();
                 if sink_return.send(buf).await.is_err() {
-                    debug!("[Flow {flow_number}] {side:?} writer: error returning buffer");
+                    debug!("[Session {session_number}] {side:?} writer: error returning buffer");
                     break;
                 }
-                debug!("[Flow {flow_number}] {side:?} writer: buffer returned");
+                debug!("[Session {session_number}] {side:?} writer: buffer returned");
             }
             Err(_) => {
                 total_bytes_written += buf.remaining();
-                debug!("[Flow {flow_number}] {side:?} writer: write error");
+                debug!("[Session {session_number}] {side:?} writer: write error");
                 break;
             }
         }
-        debug!("[Flow {flow_number}] {side:?} writer: Waiting for another buffer");
+        debug!("[Session {session_number}] {side:?} writer: Waiting for another buffer");
     }
-    debug!("[Flow {flow_number}] {side:?} writer: exiting");
-    TransferOutcome {
-        bytes_transferred: total_bytes_written,
-        side,
-        direction: Direction::Transmit,
-    }
+    debug!("[Session {session_number}] {side:?} writer: exiting");
+    total_bytes_written
 }
