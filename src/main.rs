@@ -72,6 +72,14 @@ struct WriteOptions {
     rate: Option<usize>,
 }
 
+struct ReadStats {
+    bytes_tranferred: usize,
+    buffers_used: usize,
+    smallest_buffer_length: usize,
+    largest_buffer_length: usize,
+    average_buffer_length: usize,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::init();
@@ -98,20 +106,6 @@ async fn handle_session(
 ) -> Result<()> {
     let now = std::time::Instant::now();
     let up_socket = TcpStream::connect(&settings.connect_to).await?;
-
-    // TODO: Check that the client connection is closed when there's a failure to connect
-    // to the upstream.  If this doesn't work, try the code below.
-    // let up_socket = match TcpStream::connect("127.0.0.1:8082").await {
-    //     Ok(s) => s,
-    //     Err(e) => {
-    //         info!(
-    //             "[Session {}] Error connecting to upstream: {:?}",
-    //             session_number, e
-    //         );
-    //         let _ = down_socket.shutdown().await;
-    //         return Err(e.into());
-    //     }
-    // };
 
     let (down_sock_rx, down_sock_tx) = down_socket.into_split();
     let (up_sock_rx, up_sock_tx) = up_socket.into_split();
@@ -164,8 +158,8 @@ async fn handle_session(
     };
     let downstream_tx = tokio::spawn(write(write_opts));
 
-    let downstream_bytes_read = downstream_rx.await?;
-    let upstream_bytes_read = upstream_rx.await?;
+    let downstream_read_stats = downstream_rx.await?;
+    let upstream_read_stats = upstream_rx.await?;
     let downstream_bytes_written = downstream_tx.await?;
     let upstream_bytes_written = upstream_tx.await?;
 
@@ -177,24 +171,43 @@ async fn handle_session(
         Up RX: {} ({:.0} B/s) TX: {} ({:.0} B/s)",
         session_number,
         elapsed.as_secs_f64(),
-        downstream_bytes_read,
-        downstream_bytes_read as f64 / elapsed.as_secs_f64(),
+        downstream_read_stats.bytes_tranferred,
+        downstream_read_stats.bytes_tranferred as f64 / elapsed.as_secs_f64(),
         downstream_bytes_written,
         downstream_bytes_written as f64 / elapsed.as_secs_f64(),
-        upstream_bytes_read,
-        upstream_bytes_read as f64 / elapsed.as_secs_f64(),
+        upstream_read_stats.bytes_tranferred,
+        upstream_read_stats.bytes_tranferred as f64 / elapsed.as_secs_f64(),
         upstream_bytes_written,
         upstream_bytes_written as f64 / elapsed.as_secs_f64(),
+    );
+    info!(
+        "[Session {}] Upload bufs: {}, smallest: {}, largest: {}, average: {}",
+        session_number,
+        downstream_read_stats.buffers_used,
+        downstream_read_stats.smallest_buffer_length,
+        downstream_read_stats.largest_buffer_length,
+        downstream_read_stats.average_buffer_length,
+    );
+    info!(
+        "[Session {}] Download bufs: {}, smallest: {}, largest: {}, average: {}",
+        session_number,
+        upstream_read_stats.buffers_used,
+        upstream_read_stats.smallest_buffer_length,
+        upstream_read_stats.largest_buffer_length,
+        upstream_read_stats.average_buffer_length,
     );
 
     Ok(())
 }
 
-async fn read(mut opts: ReadOptions) -> usize {
+async fn read(mut opts: ReadOptions) -> ReadStats {
     let session_number = opts.session_number;
     let side = opts.side;
     debug!("[Session {session_number}] {side:?} reader: starting");
     let mut buf_count = 0;
+    let mut total_bufs_used = 0;
+    let mut smallest_buffer_length = std::usize::MAX;
+    let mut largest_buffer_length = 0;
     let mut total_bytes_read = 0;
     loop {
         let mut buf: BytesMut = if buf_count < 2 {
@@ -226,6 +239,9 @@ async fn read(mut opts: ReadOptions) -> usize {
                     debug!("[Session {session_number}] {side:?} reader: read 0 bytes, closing");
                     break;
                 }
+                total_bufs_used += 1;
+                smallest_buffer_length = std::cmp::min(smallest_buffer_length, buf.len());
+                largest_buffer_length = std::cmp::max(largest_buffer_length, buf.len());
                 debug!(
                     "[Session {session_number}] {side:?} reader: read {} bytes, passing buffer to other side",
                     buf.len()
@@ -244,7 +260,13 @@ async fn read(mut opts: ReadOptions) -> usize {
         }
     }
     debug!("[Session {session_number}] {side:?} reader: exiting");
-    total_bytes_read
+    ReadStats {
+        bytes_tranferred: total_bytes_read,
+        buffers_used: total_bufs_used,
+        smallest_buffer_length: smallest_buffer_length,
+        largest_buffer_length: largest_buffer_length,
+        average_buffer_length: total_bytes_read / total_bufs_used,
+    }
 }
 
 async fn write(mut opts: WriteOptions) -> usize {
