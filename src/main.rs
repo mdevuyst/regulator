@@ -24,13 +24,31 @@ async fn main() -> Result<()> {
         let (socket, _) = listener.accept().await?;
         session_counter += 1;
         tokio::spawn(async move {
-            let _ = handle_session(socket, session_counter).await;
+            let res = handle_session(socket, session_counter).await;
+            if let Err(e) = res {
+                info!("Error: {:?}", e);
+            }
         });
     }
 }
 
 async fn handle_session(down_socket: TcpStream, session_number: u64) -> Result<()> {
-    let up_socket = TcpStream::connect("127.0.0.1:8081").await?;
+    let now = std::time::Instant::now();
+    let up_socket = TcpStream::connect("127.0.0.1:8082").await?;
+
+    // TODO: Check that the client connection is closed when there's a failure to connect
+    // to the upstream.  If this doesn't work, try the code below.
+    // let up_socket = match TcpStream::connect("127.0.0.1:8082").await {
+    //     Ok(s) => s,
+    //     Err(e) => {
+    //         info!(
+    //             "[Session {}] Error connecting to upstream: {:?}",
+    //             session_number, e
+    //         );
+    //         let _ = down_socket.shutdown().await;
+    //         return Err(e.into());
+    //     }
+    // };
 
     let (down_sock_rx, down_sock_tx) = down_socket.into_split();
     let (up_sock_rx, up_sock_tx) = up_socket.into_split();
@@ -76,14 +94,22 @@ async fn handle_session(down_socket: TcpStream, session_number: u64) -> Result<(
     let downstream_bytes_written = downstream_tx.await?;
     let upstream_bytes_written = upstream_tx.await?;
 
-    // TODO: report the duration of the flow.
+    let elapsed = now.elapsed();
+
     info!(
-        "[Session {}] Downstream RX: {} TX: {} Upstream RX: {} TX: {}",
+        "[Session {}] Duration: {:.6} sec, \
+        Downstream RX: {} bytes ({:.0} bytes/sec) TX: {} bytes ({:.0} bytes/sec) \
+        Upstream RX: {} bytes ({:.0} bytes/sec) TX: {} bytes ({:.0} bytes/sec)",
         session_number,
+        elapsed.as_secs_f64(),
         downstream_bytes_read,
+        downstream_bytes_read as f64 / elapsed.as_secs_f64(),
         downstream_bytes_written,
+        downstream_bytes_written as f64 / elapsed.as_secs_f64(),
         upstream_bytes_read,
-        upstream_bytes_written
+        upstream_bytes_read as f64 / elapsed.as_secs_f64(),
+        upstream_bytes_written,
+        upstream_bytes_written as f64 / elapsed.as_secs_f64(),
     );
 
     Ok(())
