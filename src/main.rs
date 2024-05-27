@@ -47,6 +47,10 @@ struct Settings {
     /// The download rate (given in Bytes per second)
     #[arg(short, long)]
     download_rate: Option<u64>,
+
+    /// Enable verbose logging
+    #[arg(short, long)]
+    verbose: bool,
 }
 
 #[derive(Debug)]
@@ -90,8 +94,15 @@ struct WriteStats {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
     let settings = Settings::parse();
+
+    let mut logging = env_logger::Builder::new();
+    let logging = if settings.verbose {
+        logging.filter_level(log::LevelFilter::Debug)
+    } else {
+        logging.filter_level(log::LevelFilter::Info)
+    };
+    logging.init();
 
     let listener = TcpListener::bind(&settings.listen).await?;
     let mut session_counter = 0;
