@@ -92,6 +92,7 @@ struct WriteStats {
 async fn main() -> Result<()> {
     env_logger::init();
     let settings = Settings::parse();
+
     let listener = TcpListener::bind(&settings.listen).await?;
     let mut session_counter = 0;
     info!("Listening on {}", settings.listen);
@@ -117,7 +118,7 @@ async fn handle_session(
     settings: Settings,
 ) -> Result<()> {
     let now = std::time::Instant::now();
-    let pre = format!("[Session {session_number}] ");
+    let pre = format!("[Session {session_number}]");
     debug!("{pre} Connecting to {}", settings.connect_to);
     let up_socket = TcpStream::connect(&settings.connect_to).await?;
     info!("{pre} Connected to {}", settings.connect_to);
@@ -179,7 +180,7 @@ async fn handle_session(
         sink_return,
         side: Side::Downstream,
         session_number,
-        rate: settings.upload_rate,
+        rate: settings.download_rate,
     };
     let downstream_tx = tokio::spawn(write(write_opts));
 
@@ -192,6 +193,26 @@ async fn handle_session(
 
     let elapsed = now.elapsed();
 
+    print_session_stats(
+        session_number,
+        elapsed,
+        &downstream_read_stats,
+        &downstream_write_stats,
+        &upstream_read_stats,
+        &upstream_write_stats,
+    );
+
+    Ok(())
+}
+
+fn print_session_stats(
+    session_number: u64,
+    elapsed: std::time::Duration,
+    downstream_read_stats: &ReadStats,
+    downstream_write_stats: &WriteStats,
+    upstream_read_stats: &ReadStats,
+    upstream_write_stats: &WriteStats,
+) {
     if downstream_read_stats.bytes_read != upstream_write_stats.bytes_written {
         warn!(
             "[Session {}] Warning: Downstream read {} bytes, upstream wrote {} bytes",
@@ -206,19 +227,13 @@ async fn handle_session(
     }
 
     info!(
-        "[Session {}] Time: {:.3} sec, \
-        Down RX: {} ({}/s) TX: {} ({}/s) \
-        Up RX: {} ({}/s) TX: {} ({}/s)",
+        "[Session {}] Time: {:.3} sec, Uploaded {} ({}/s) Downloaded {} ({}/s)",
         session_number,
         elapsed.as_secs_f64(),
-        ByteSize(downstream_read_stats.bytes_read),
-        ByteSize(downstream_read_stats.bytes_read / max(elapsed.as_secs(), 1)),
-        ByteSize(downstream_write_stats.bytes_written),
-        ByteSize(downstream_write_stats.bytes_written / max(elapsed.as_secs(), 1)),
-        ByteSize(upstream_read_stats.bytes_read),
-        ByteSize(upstream_read_stats.bytes_read / max(elapsed.as_secs(), 1)),
         ByteSize(upstream_write_stats.bytes_written),
         ByteSize(upstream_write_stats.bytes_written / max(elapsed.as_secs(), 1)),
+        ByteSize(downstream_write_stats.bytes_written),
+        ByteSize(downstream_write_stats.bytes_written / max(elapsed.as_secs(), 1)),
     );
     info!(
         "[Session {}] Upload bufs: {}, smallest: {}, largest: {}, average: {}",
@@ -244,8 +259,6 @@ async fn handle_session(
         downstream_write_stats.num_sleeps,
         downstream_write_stats.total_sleep_time.as_secs_f64(),
     );
-
-    Ok(())
 }
 
 async fn read(mut opts: ReadOptions) -> ReadStats {
