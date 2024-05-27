@@ -55,7 +55,7 @@ enum Side {
 
 struct ReadOptions {
     sock_rx: OwnedReadHalf,
-    source: Sender<BytesMut>,
+    source: Sender<Option<BytesMut>>,
     source_return: Receiver<BytesMut>,
     side: Side,
     session_number: u64,
@@ -65,7 +65,7 @@ struct ReadOptions {
 
 struct WriteOptions {
     sock_tx: OwnedWriteHalf,
-    sink: Receiver<BytesMut>,
+    sink: Receiver<Option<BytesMut>>,
     sink_return: Sender<BytesMut>,
     side: Side,
     session_number: u64,
@@ -110,8 +110,10 @@ async fn handle_session(
     let (down_sock_rx, down_sock_tx) = down_socket.into_split();
     let (up_sock_rx, up_sock_tx) = up_socket.into_split();
 
-    let (source, sink): (Sender<BytesMut>, Receiver<BytesMut>) = mpsc::channel(4);
-    let (sink_return, source_return): (Sender<BytesMut>, Receiver<BytesMut>) = mpsc::channel(4);
+    let (source, sink): (Sender<Option<BytesMut>>, Receiver<Option<BytesMut>>) =
+        mpsc::channel(settings.upload_num_bufs);
+    let (sink_return, source_return): (Sender<BytesMut>, Receiver<BytesMut>) =
+        mpsc::channel(settings.upload_num_bufs);
 
     let read_opts = ReadOptions {
         sock_rx: down_sock_rx,
@@ -134,8 +136,10 @@ async fn handle_session(
     };
     let upstream_tx = tokio::spawn(write(write_opts));
 
-    let (source, sink): (Sender<BytesMut>, Receiver<BytesMut>) = mpsc::channel(4);
-    let (sink_return, source_return): (Sender<BytesMut>, Receiver<BytesMut>) = mpsc::channel(4);
+    let (source, sink): (Sender<Option<BytesMut>>, Receiver<Option<BytesMut>>) =
+        mpsc::channel(settings.download_num_bufs);
+    let (sink_return, source_return): (Sender<BytesMut>, Receiver<BytesMut>) =
+        mpsc::channel(settings.download_num_bufs);
 
     let read_opts = ReadOptions {
         sock_rx: up_sock_rx,
@@ -210,10 +214,14 @@ async fn read(mut opts: ReadOptions) -> ReadStats {
     let mut largest_buffer_length = 0;
     let mut total_bytes_read = 0;
     loop {
-        let mut buf: BytesMut = if buf_count < 2 {
-            debug!("[Session {session_number}] {side:?} reader: creating new buffer");
+        let mut buf: BytesMut = if buf_count < opts.num_bufs {
+            debug!(
+                "[Session {session_number}] {side:?} reader: creating buffer {} of {}",
+                buf_count + 1,
+                opts.num_bufs
+            );
             buf_count += 1;
-            BytesMut::with_capacity(1024)
+            BytesMut::with_capacity(opts.buf_size)
         } else {
             debug!("[Session {session_number}] {side:?} reader: waiting for return buffer");
             match opts.source_return.recv().await {
@@ -236,7 +244,23 @@ async fn read(mut opts: ReadOptions) -> ReadStats {
             Ok(_) => {
                 total_bytes_read += buf.len();
                 if buf.is_empty() {
-                    debug!("[Session {session_number}] {side:?} reader: read 0 bytes, closing");
+                    // The peer has closed the connection.  Send a None to the
+                    // writer to signal that it should exit.  Then wait for it to exit (by waiting
+                    // for the mpsc channel to return an error, indicating that was closed).  If we
+                    // exit immediately, the mpsc channel will be immediately closed and the writer
+                    // may not have a chance to send all the buffers.
+                    debug!("[Session {session_number}] {side:?} reader: read 0 bytes");
+                    if opts.source.send(None).await.is_err() {
+                        debug!(
+                            "[Session {session_number}] {side:?} reader: error passing buffer to other side"
+                        );
+                        break;
+                    }
+                    // Wait until the writer exits.
+                    while opts.source_return.recv().await.is_some() {}
+                    debug!(
+                        "[Session {session_number}] {side:?} reader: writer has exited, exiting"
+                    );
                     break;
                 }
                 total_bufs_used += 1;
@@ -246,7 +270,7 @@ async fn read(mut opts: ReadOptions) -> ReadStats {
                     "[Session {session_number}] {side:?} reader: read {} bytes, passing buffer to other side",
                     buf.len()
                 );
-                if opts.source.send(buf).await.is_err() {
+                if opts.source.send(Some(buf)).await.is_err() {
                     debug!(
                         "[Session {session_number}] {side:?} reader: error passing buffer to other side"
                     );
@@ -263,9 +287,17 @@ async fn read(mut opts: ReadOptions) -> ReadStats {
     ReadStats {
         bytes_tranferred: total_bytes_read,
         buffers_used: total_bufs_used,
-        smallest_buffer_length: smallest_buffer_length,
-        largest_buffer_length: largest_buffer_length,
-        average_buffer_length: total_bytes_read / total_bufs_used,
+        smallest_buffer_length,
+        largest_buffer_length: if total_bufs_used > 0 {
+            largest_buffer_length
+        } else {
+            0
+        },
+        average_buffer_length: if total_bufs_used != 0 {
+            total_bytes_read / total_bufs_used
+        } else {
+            0
+        },
     }
 }
 
@@ -274,7 +306,13 @@ async fn write(mut opts: WriteOptions) -> usize {
     let side = opts.side;
     debug!("[Session {session_number}] {side:?} writer: starting and waiting for a buffer");
     let mut total_bytes_written = 0;
-    while let Some(mut buf) = opts.sink.recv().await {
+    while let Some(buf) = opts.sink.recv().await {
+        // The reader will send a None when it has finished reading.  If we get a None, we should
+        // exit (dropping the mpsc channel, and causing the reader to exit as well).
+        let Some(mut buf) = buf else {
+            debug!("[Session {session_number}] {side:?} writer: got None, exiting");
+            break;
+        };
         let buf_len = buf.len();
         debug!("[Session {session_number}] {side:?} writer: got a buffer, writing...");
         match opts.sock_tx.write_all_buf(&mut buf).await {
