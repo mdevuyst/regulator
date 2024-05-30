@@ -2,6 +2,10 @@
 name = "regulator"
 version = "0.1.0"
 edition = "2021"
+authors = ["Matt DeVuyst"]
+description = "A tool to proxy and rate limit TCP connections"
+license = "MIT"
+keywords = ["proxy", "rate-limit"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
